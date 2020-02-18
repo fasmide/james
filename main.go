@@ -41,6 +41,8 @@ var (
 	urls          []string
 	guessRemoteIP bool
 	dumpPath      string
+	cachePath     string
+	maxCacheAge   time.Duration
 
 	rootCmd = &cobra.Command{
 		Use:    appName,
@@ -118,6 +120,8 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&guessRemoteIP, "guess-remote-ip", "", true, "Try to guess remote IP. Requires root")
 	rootCmd.PersistentFlags().BoolVarP(&useSyslog, "use-syslog", "", useSyslog, "Log to syslog")
 	rootCmd.PersistentFlags().StringVarP(&dumpPath, "dump", "", "", "Dump HTTP request/response to path")
+	rootCmd.PersistentFlags().StringVarP(&cachePath, "cache-path", "", "/var/cache/james", "Path to authorized_key cache, must be directory")
+	rootCmd.PersistentFlags().DurationVarP(&maxCacheAge, "max-cache-age", "", time.Hour, "Fetch new auhtorized keys when exeeded, zero value disables cache")
 }
 
 func prerun(_ *cobra.Command, _ []string) {
@@ -137,6 +141,20 @@ func prerun(_ *cobra.Command, _ []string) {
 		}
 		dumpWriter = w
 	}
+
+	// if no urls where provided - default to github
+	if len(urls) == 0 {
+		urls = []string{fmt.Sprintf("https://github.com/%s.keys", username)}
+	}
+
+	// if cache is non-zero - ensure cachePath is a directory
+	if maxCacheAge != 0 {
+		err := os.MkdirAll(cachePath, 0600)
+		if err != nil {
+			log.Fatalf("unable to create directory %s: %s", cachePath, err)
+		}
+	}
+
 }
 
 // httpDo will try a http request multiple times if the server responds
@@ -217,10 +235,10 @@ func doKeyRequest(url *url.URL) keyResponse {
 }
 
 func root(_ *cobra.Command, _ []string) {
-	if len(urls) == 0 {
-		urls = []string{fmt.Sprintf("https://github.com/%s.keys", username)}
-	}
+	// cache path is
+}
 
+func fetch() {
 	q := url.Values{}
 
 	if guessRemoteIP {
@@ -272,39 +290,45 @@ func root(_ *cobra.Command, _ []string) {
 	}
 
 	results := make(chan keyResponse, len(urls))
-	concurrency := make(chan struct{}, 5)
 
-	var wg sync.WaitGroup
-	for _, u := range urls {
+	go func() {
+		var wg sync.WaitGroup
+		concurrency := make(chan struct{}, 5)
 
-		reqURL, err := url.Parse(u)
-		if err != nil {
-			log.Fatalf("unable to parse url %s: %s", u, err)
+		for _, u := range urls {
+			reqURL, err := url.Parse(u)
+			if err != nil {
+				log.Fatalf("unable to parse url %s: %s", u, err)
+			}
+
+			reqURL.RawQuery = q.Encode()
+			wg.Add(1)
+			go func(u *url.URL) {
+				concurrency <- struct{}{}
+				results <- doKeyRequest(reqURL)
+				wg.Done()
+				<-concurrency
+			}(reqURL)
 		}
 
-		reqURL.RawQuery = q.Encode()
-		wg.Add(1)
-		go func(u *url.URL) {
-			concurrency <- struct{}{}
-			results <- doKeyRequest(reqURL)
-			wg.Done()
-			<-concurrency
-		}(reqURL)
-	}
+		wg.Wait()
+		close(results)
+	}()
 
-	wg.Wait()
-	close(results)
+	reader, writer := io.Pipe()
+	go func() {
+		for k := range results {
+			if k.Error != nil {
+				fmt.Fprintf(writer, "# %s\n## Error: %s\n\n", k.URL, k.Error)
+				log.Printf("key result error: %s", k.Error)
 
-	// output results one at a time
-	for k := range results {
-		if k.Error != nil {
-			fmt.Fprintf(os.Stdout, "# %s\n## Error: %s\n\n", k.URL, k.Error)
-			log.Printf("key result error: %s", k.Error)
-
-		} else {
-			fmt.Fprintf(os.Stdout, "# %s\n%s\n", k.URL, k.Payload)
+			} else {
+				fmt.Fprintf(writer, "# %s\n%s\n", k.URL, k.Payload)
+			}
 		}
-	}
+		writer.Close()
+	}()
+	return reader
 }
 
 func getOpenSockets(pid int) ([]int, error) {
