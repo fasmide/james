@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -13,6 +14,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -235,10 +237,87 @@ func doKeyRequest(url *url.URL) keyResponse {
 }
 
 func root(_ *cobra.Command, _ []string) {
-	// cache path is
+	query := buildQuery()
+
+	if maxCacheAge == 0 {
+		reader, _ := fetchUrls(query)
+		io.Copy(os.Stdout, reader)
+		return
+	}
+
+	// if we have a good cache - return it
+	reader, err := fetchCache(query)
+	if err == nil {
+		io.Copy(os.Stdout, reader)
+		return
+	}
+
+	log.Printf("invalid cache: %s", err)
+
+	// if we dont have a good cache - fetch a new one and save it
+	// only if all urls succeeded
+	cacheWriter, err := ioutil.TempFile(cachePath, "")
+	if err != nil {
+		log.Fatalf("unable to create temporary file for cache writing: %s", err)
+	}
+
+	reader, errors := fetchUrls(query)
+	reader = io.TeeReader(reader, cacheWriter)
+	io.Copy(os.Stdout, reader)
+
+	errorCtr := 0
+	for {
+		_, ok := <-errors
+		if !ok {
+			break
+		}
+
+		errorCtr++
+	}
+
+	if errorCtr != 0 {
+		log.Printf("not caching bad results: %d errors occurred", errorCtr)
+		os.Remove(cacheWriter.Name())
+		return
+	}
+
+	os.Rename(cacheWriter.Name(), cacheName(query))
+
 }
 
-func fetch() {
+func cacheName(q url.Values) string {
+	// to ensure proper cache invalidation, we use a hash of all urls including query parameters as filename
+	h := sha256.New()
+	for _, u := range urls {
+		h.Write([]byte(u))
+	}
+
+	h.Write([]byte(q.Encode()))
+	p := path.Join(cachePath, fmt.Sprintf("%X", h.Sum(nil)))
+
+	return p
+}
+
+func fetchCache(q url.Values) (io.Reader, error) {
+	p := cacheName(q)
+	// to further ensure cache invalidation, we stat the file to see if it has expired
+	info, err := os.Stat(p)
+	if err != nil {
+		return nil, err
+	}
+
+	if time.Now().Sub(info.ModTime()) > maxCacheAge {
+		return nil, fmt.Errorf("%s more then %s old: %s",
+			p,
+			maxCacheAge,
+			info.ModTime().Sub(time.Now()),
+		)
+	}
+
+	return os.Open(p)
+}
+
+func buildQuery() url.Values {
 	q := url.Values{}
 
 	if guessRemoteIP {
@@ -289,7 +368,12 @@ func fetch() {
 		q.Add("username", username)
 	}
 
+	return q
+}
+
+func fetchUrls(q url.Values) (io.Reader, chan error) {
 	results := make(chan keyResponse, len(urls))
+	errors := make(chan error, len(urls))
 
 	go func() {
 		var wg sync.WaitGroup
@@ -321,14 +405,17 @@ func fetch() {
 			if k.Error != nil {
 				fmt.Fprintf(writer, "# %s\n## Error: %s\n\n", k.URL, k.Error)
 				log.Printf("key result error: %s", k.Error)
-
+				errors <- k.Error
 			} else {
 				fmt.Fprintf(writer, "# %s\n%s\n", k.URL, k.Payload)
 			}
 		}
+
 		writer.Close()
+		close(errors)
 	}()
-	return reader
+
+	return reader, errors
 }
 
 func getOpenSockets(pid int) ([]int, error) {
